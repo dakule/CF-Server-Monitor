@@ -10,7 +10,9 @@
 //
 // - 前端订阅连接使用 DO WebSocket Hibernation API，闲置时休眠以节省资源。
 //   通过 setWebSocketAutoResponse 自动响应 ping，无需唤醒 DO。
-// - Agent 上报连接使用标准 WebSocket API，避免高频指标消息计为 hibernation wakeup。
+// - Agent 上报连接同样走 Hibernation API（acceptWebSocket + tag），连接挂着时 DO 可休眠。
+//   千万不要退回 server.accept()：那会让 DO 在整条连接存活期间持续产生 duration，
+//   128MB × 24h ≈ 11,059 GB-s/天，免费套餐的 13,000 GB-s/天 一天就被一条连接吃光。
 
 import { saveMetricsHistory } from '../database/schema.js';
 import { evaluateTrafficAlert } from '../services/notification.js';
@@ -304,8 +306,6 @@ export class MetricsBroadcaster {
     this.resourceAlertCacheActiveUntil = 0;
     this.agentServerDetails = new Map();
     this.agentHistoryWrites = new Map();
-    this.standardAgentWebSocketCount = 0;
-    this.standardAgentWebSockets = new Set();
     this.lastAgentRealtimeHintAt = 0;
     this.pendingFrontendBroadcasts = new Map();
     this.frontendBroadcastTimer = null;
@@ -465,14 +465,12 @@ export class MetricsBroadcaster {
   }
 
   _getAgentReportWebSockets() {
-    const sockets = new Set(this.standardAgentWebSockets);
-    for (const ws of this.state.getWebSockets()) {
+    // 休眠中的连接也会出现在 getWebSockets() 里，所以只靠 attachment 分流，
+    // 不再维护内存 Set（休眠后实例被回收，内存集合必然丢，靠它统计会漏）。
+    return this.state.getWebSockets().filter(ws => {
       const attachment = ws.deserializeAttachment();
-      if (attachment?.kind === AGENT_REPORT_KIND) {
-        sockets.add(ws);
-      }
-    }
-    return Array.from(sockets);
+      return attachment?.kind === AGENT_REPORT_KIND;
+    });
   }
 
   _isWebSocketUpgrade(request) {
@@ -486,44 +484,16 @@ export class MetricsBroadcaster {
     } catch (_) {}
   }
 
-  _acceptStandardAgentWebSocket(server, initialAttachment) {
-    // Agent 上报连接使用标准 WebSocket API，避免每条业务消息都成为 hibernation wakeup。
-    // 代价是只要 Agent 长连接存在，本 DO 就不能休眠，会持续产生 duration。
-    server.accept();
-
-    const session = { attachment: initialAttachment || {} };
-    const ws = {
-      send: data => server.send(data),
-      close: (code, reason) => server.close(code, reason),
-      serializeAttachment(value) {
-        session.attachment = value || {};
-      },
-      deserializeAttachment() {
-        return session.attachment;
-      }
-    };
-
-    this.standardAgentWebSocketCount += 1;
-    this.standardAgentWebSockets.add(ws);
-    let cleaned = false;
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      this.standardAgentWebSocketCount = Math.max(0, this.standardAgentWebSocketCount - 1);
-      this.standardAgentWebSockets.delete(ws);
-    };
-
-    server.addEventListener('message', event => {
-      this._handleAgentReportMessage(ws, event.data, ws.deserializeAttachment())
-        .catch(error => {
-          console.warn('[update-ws] Agent standard WebSocket message failed:', error?.message || error);
-          this._closeWsWithError(ws, 'Internal error', 500);
-        });
-    });
-    server.addEventListener('close', cleanup);
-    server.addEventListener('error', cleanup);
-
-    return ws;
+  _acceptAgentReportWebSocket(server, initialAttachment) {
+    // Agent 上报连接必须走 Hibernation API（acceptWebSocket），不能用 server.accept()。
+    // 用 server.accept() 时，只要 Agent 长连接存在，本 DO 就无法休眠，
+    // 会按“连接存活时长”全程计 duration：128MB × 24h ≈ 11,059 GB-s/天，
+    // 而免费套餐整个账号只有 13,000 GB-s/天，单这一条就能撞穿。
+    // 换成 acceptWebSocket 后，连接挂着时 DO 可以休眠，只在真正收到上报帧时短暂唤醒。
+    // 帧的处理入口是下面的 webSocketMessage()（已按 attachment.kind 分流）。
+    this.state.acceptWebSocket(server, [AGENT_REPORT_KIND]);
+    server.serializeAttachment(initialAttachment || {});
+    return server;
   }
 
   _closeWsWithError(ws, message, code = 400, extra = {}, closeCode = WS_POLICY_VIOLATION, closeReason = message) {
@@ -1252,6 +1222,11 @@ export class MetricsBroadcaster {
   }
 
   async _persistAgentHistoryIfDue(ws, attachment, payload) {
+    // 节流状态分两层：`lastD1WriteTs` 落在 attachment 里（休眠/回收都不丢），
+    // 所以“多久写一次 D1”在换成 Hibernation 后依然成立；
+    // 只有 pendingHistoryAggregate（两帧之间的 max/avg 合并）是纯内存，
+    // 实例被回收就丢——上报间隔 2s、回收要求空闲，实际几乎不会在连续上报中途发生，
+    // 最坏情况只是这一条历史记录的 max/avg 少合并了几帧，不影响落库频率与费用。
     const serverId = String(payload.serverId || '');
     const now = Date.now();
     const state = this.agentHistoryWrites.get(serverId) || {};
@@ -1489,7 +1464,7 @@ export class MetricsBroadcaster {
     nextHour.setUTCMinutes(60, 0, 0);
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    const agentSocket = this._acceptStandardAgentWebSocket(server, {
+    const agentSocket = this._acceptAgentReportWebSocket(server, {
       kind: AGENT_REPORT_KIND,
       authenticated: false,
       serverId: '',
@@ -1772,10 +1747,10 @@ export class MetricsBroadcaster {
     // ── 3) 健康检查 ────────────────────────────────────
     if (method === 'GET' && (path === '/health' || path.endsWith('/health'))) {
       const subscribers = this._getFrontendSubscriberCount();
-      const agentSockets = this.standardAgentWebSocketCount;
-      const sockets = this.state.getWebSockets().length + agentSockets;
+      const agentSockets = this._getAgentReportWebSockets().length;
+      const sockets = this.state.getWebSockets().length;
       return new Response(JSON.stringify({ ok: true, subscribers, sockets, agentSockets }), {
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' }
       });
     }
 

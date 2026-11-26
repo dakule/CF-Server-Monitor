@@ -510,8 +510,8 @@ CORS_ALLOWED_ORIGINS=https://status.example.com,https://admin.example.com
 **WebSocket 计费注意**
 
 - 建立 `wss://.../update` 连接需要一次 `GET + Upgrade`，该握手按一次 Workers request 计入。
-- 连接建立后的 Agent 上报消息由 Durable Object 标准 WebSocket API 接收，不使用 Hibernation API 接管 `/update` 连接；它们作为 Durable Objects WebSocket incoming messages 计量，Cloudflare 计费口径按 `20:1` 折算为 DO requests。
-- 该模式避免高频 Agent 指标消息表现为 hibernation wakeup，但只要 Agent 长连接存在，DO 会保持非休眠状态并产生 duration（GB-s）。前端订阅 `/api/ws` 仍使用 WebSocket Hibernation API。
+- 连接建立后的 Agent 上报消息由 Durable Object Hibernation API（`state.acceptWebSocket()` + `webSocketMessage()`）接收，连接挂着时 DO 可以休眠，只在收到上报帧时短暂唤醒；入场帧按 Durable Objects WebSocket incoming messages 计量，Cloudflare 计费口径按 `20:1` 折算为 DO requests。
+- **不要退回标准 WebSocket API（`server.accept()`）**：那会让 DO 在整条连接存活期间持续产生 duration，`128MB × 24h ≈ 11,059 GB-s/天`，而免费套餐整个账号只有 `13,000 GB-s/天`，单条长连接就能一天撞穿额度、之后所有 DO 请求被拒。前端订阅 `/api/ws` 与 Agent 上报 `/update` 现在使用同一套 Hibernation 机制。
 - 因此，Agent 应保持长连接；不要每次采样都断开重连。错误 `id` / `secret` 当前在 DO 消息阶段返回错误帧并关闭，避免每次上报都走 Worker 401。
 
 **副作用**
